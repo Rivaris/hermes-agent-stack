@@ -194,7 +194,27 @@ class WorkerRPC:
                     self._drop()
                     link = self._connection()
                     link.send(request_id, message)
-                response = link.receive(20)
+                # The owner commits persistence writes with path-specific patience
+                # (SessionDB class attrs, hermes_state.py:488): _WRITE_PATIENCE_S=20.0 (routine
+                # writes) and _TRANSCRIPT_WRITE_PATIENCE_S=60.0 (transcript writes). A worker budget
+                # frozen at the 20s routine-write patience let a saturated owner's slow-but-legitimate
+                # reply (landing in the 20-60s window) kill the worker via WorkerPersistenceError:
+                # worker_receipt_timeout (kanban_worker_client.py:150). Wait the longer of the owner's
+                # two write patiences plus a margin, derived from the canonical constants (max) so the
+                # budget cannot silently re-diverge from the owner's actual patience. Lazy in-function
+                # import (like runtime_session_store.py:383/:460) avoids an import cycle. Override via
+                # HERMES_WORKER_RECEIPT_BUDGET_S (floor-clamped >= 20.0, ceiling 300.0).
+                from hermes_state import SessionDB
+                _budget_s = max(SessionDB._WRITE_PATIENCE_S, SessionDB._TRANSCRIPT_WRITE_PATIENCE_S) + 10.0
+                _env_budget = os.getenv('HERMES_WORKER_RECEIPT_BUDGET_S')
+                if _env_budget:
+                    try:
+                        _budget_s = max(20.0, min(float(_env_budget), 300.0))
+                    except ValueError:
+                        logger.warning(
+                            'HERMES_WORKER_RECEIPT_BUDGET_S=%r not a float; falling back to %.1fs',
+                            _env_budget, _budget_s)
+                response = link.receive(_budget_s)
             except BaseException:
                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
                 self._drop()
