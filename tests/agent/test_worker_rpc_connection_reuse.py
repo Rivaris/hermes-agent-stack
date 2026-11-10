@@ -271,3 +271,64 @@ def test_an_owner_error_reply_keeps_the_connection_for_the_next_call(owner, tmp_
     assert rpc('worker.persist') == {'n': 2}
     assert owner.requests == ['fail', 'worker.persist']
     assert (owner.connections, owner.tickets) == (1, 1)
+
+
+def _capturing_receive(monkeypatch):
+    """Wrap ``_OwnerLink.receive`` to record the timeout each persistence call waits for."""
+    from agent.runtime_session_store import _OwnerLink
+
+    real = _OwnerLink.receive
+    seen = []
+
+    def receive(self, timeout):
+        seen.append(timeout)
+        return real(self, timeout)
+
+    monkeypatch.setattr(_OwnerLink, 'receive', receive)
+    return seen
+
+
+def test_receipt_budget_is_the_owner_write_patience_max_plus_margin(owner, tmp_path, monkeypatch):
+    """The receipt budget that reaches the link is max of SessionDB's write patiences + 10,
+    asserted against the constants (not a literal 70) so the test does not rot when they move.
+
+    Regression for the hard-coded ``link.receive(20)``: a budget frozen at the routine 20 s
+    write patience let a saturated owner's legitimate 20-60 s reply raise
+    WorkerPersistenceError: worker_receipt_timeout and die before its admission was settled.
+    """
+    from hermes_state import SessionDB
+    from agent.runtime_session_store import WorkerRPC
+
+    seen = _capturing_receive(monkeypatch)
+    rpc = WorkerRPC(tmp_path)
+    assert rpc('worker.persist') == {'n': 1}
+    expected = max(SessionDB._WRITE_PATIENCE_S, SessionDB._TRANSCRIPT_WRITE_PATIENCE_S) + 10.0
+    assert seen == [expected]
+
+
+@pytest.mark.parametrize('env_value,outcome', [
+    (None, 'default'),     # unset -> derived default
+    ('15', 20.0),          # below floor -> 20
+    ('20', 20.0),          # at floor -> 20
+    ('70', 70.0),          # within range -> passthrough
+    ('300', 300.0),        # at ceiling -> 300
+    ('500', 300.0),        # above ceiling -> 300
+    ('abc', 'default'),    # non-numeric -> logged fallback
+])
+def test_receipt_budget_override_is_clamped_and_falls_back_on_garbage(
+        owner, tmp_path, monkeypatch, env_value, outcome):
+    """The env override is floor/ceiling clamped to [20, 300]; a non-numeric value logs a
+    warning and falls back to the derived default (a typo cannot set 2 s)."""
+    from hermes_state import SessionDB
+    from agent.runtime_session_store import WorkerRPC
+
+    default = max(SessionDB._WRITE_PATIENCE_S, SessionDB._TRANSCRIPT_WRITE_PATIENCE_S) + 10.0
+    if env_value is None:
+        monkeypatch.delenv('HERMES_WORKER_RECEIPT_BUDGET_S', raising=False)
+    else:
+        monkeypatch.setenv('HERMES_WORKER_RECEIPT_BUDGET_S', env_value)
+    seen = _capturing_receive(monkeypatch)
+    rpc = WorkerRPC(tmp_path)
+    assert rpc('worker.persist') == {'n': 1}
+    expected = default if outcome == 'default' else outcome
+    assert seen == [expected]
